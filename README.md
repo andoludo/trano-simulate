@@ -19,6 +19,20 @@ result.success, result.result_path, result.error_kind, result.error_message
 `runtime="docker"` needs Docker; `runtime="local"` needs OpenModelica's `omc` on the PATH, with the Modelica
 libraries installed (`trano-install-libraries`).
 
+## Reports
+
+A report needs two files: the description of the model, which trano writes next to the model it generates
+(`<name>.description.json`: its spaces, constructions and systems, and the result variables to plot), and the result
+file of the simulation.
+
+```python
+from trano_simulate.reporting import ModelDocumentation, to_docx, to_html_reporting
+
+documentation = ModelDocumentation.from_files(Path("house.description.json"), Path("run/results/house.building_res.mat"))
+Path("house.html").write_text(to_html_reporting(documentation))
+to_docx(documentation, Path("house.docx"))
+```
+
 ## Development
 
 ```bash
