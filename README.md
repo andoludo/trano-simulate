@@ -19,6 +19,17 @@ result.success, result.result_path, result.error_kind, result.error_message
 `runtime="docker"` needs Docker; `runtime="local"` needs OpenModelica's `omc` on the PATH, with the Modelica
 libraries installed (`trano-install-libraries`).
 
+A package that uses a Modelica library without holding it names the folder of that library: it is loaded before
+the package (mounted read-only in the container with `runtime="docker"`).
+
+```python
+import fastsmoothbuildings
+
+package = ModelPackage(name="house", source=source, libraries=(fastsmoothbuildings.LIBRARY,))
+```
+
+A `ModelSource` (trano's `Network`) may give the same folders as its attribute `libraries`.
+
 ## Reports
 
 A report needs two files: the description of the model, which trano writes next to the model it generates

@@ -14,7 +14,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from enum import StrEnum
 from http import HTTPStatus
@@ -30,6 +30,7 @@ from trano_simulate.result import SimulationErrorKind, SimulationResult, truncat
 
 RUNTIME_VARIABLE = "TRANO_SIMULATION_RUNTIME"
 CONTAINER_MODEL_DIR = PurePosixPath("/simulation")  # where the project directory is mounted in the container
+CONTAINER_USED_LIBRARIES = PurePosixPath("/libraries")  # where the libraries a model uses are mounted, read-only
 TIMEOUT_EXIT_CODE = 124  # exit code of coreutils' ``timeout`` when it stops the command
 
 
@@ -72,12 +73,20 @@ class ModelPackage(BaseModel):
 
     name: str
     source: str
+    libraries: tuple[Path, ...] = Field(
+        default=(),
+        description="Folders of the Modelica libraries the package uses without holding them (each holds its "
+        "package.mo, as fastsmoothbuildings.LIBRARY): loaded before the package.",
+    )
 
 
 @runtime_checkable
 class ModelSource(Protocol):
     """What renders a ``ModelPackage`` for a run, such as trano's ``Network``: its name, the files it reads copied
-    into the project directory (paths written as ``omc`` sees that directory), and its Modelica text."""
+    into the project directory (paths written as ``omc`` sees that directory), and its Modelica text.
+
+    A source may also have ``libraries``, the folders of the Modelica libraries its text uses without holding them
+    (as ``ModelPackage.libraries``)."""
 
     name: str
 
@@ -96,6 +105,16 @@ def resolve_runtime(runtime: SimulationRuntime | str | None = None) -> Simulatio
 def model_directory(runtime: SimulationRuntime, project_path: Path) -> PurePath:
     """The project directory as ``omc`` sees it: mounted in the container, or the directory itself."""
     return CONTAINER_MODEL_DIR if runtime is SimulationRuntime.docker else project_path.resolve()
+
+
+def used_libraries(model: Model) -> tuple[Path, ...]:
+    """The folders of the Modelica libraries ``model`` uses without holding them (optional on a source)."""
+    return tuple(Path(library) for library in getattr(model, "libraries", ()))
+
+
+def library_directory(library: Path, model_dir: PurePath) -> PurePath:
+    """The folder of a library as ``omc`` sees it: mounted in the container, or the folder itself."""
+    return CONTAINER_USED_LIBRARIES / library.name if model_dir == CONTAINER_MODEL_DIR else library.resolve()
 
 
 def notify(on_phase: PhaseCallback | None, phase: SimulationPhase) -> None:
@@ -313,7 +332,9 @@ def simulate_docker(  # noqa: PLR0913
     client_ = client()
     notify(on_phase, SimulationPhase.compiling)
     with (
-        container(client_, project_path, container_name=container_name) as container_,
+        container(
+            client_, project_path, container_name=container_name, libraries=used_libraries(model_network)
+        ) as container_,
         create_mos_file(model_network, options, project_path, model=model) as mos_file_name,
     ):
         command = f"omc {CONTAINER_MODEL_DIR}/{mos_file_name}"
@@ -493,14 +514,17 @@ def container(
     project_path: Path,
     environment: ModelicaEnvironment = MODELICA_ENVIRONMENT,
     container_name: str | None = None,
+    libraries: Sequence[Path] = (),
 ) -> Generator[docker.models.containers.Container, None, None]:
     """A container of the OpenModelica image with the project mounted and the libraries installed.
 
     Without ``container_name`` it gets a unique ``trano-<random>`` name, so that runs can be parallel.
+    ``libraries`` (folders of Modelica libraries the model uses) are mounted read-only under ``/libraries``.
     """
     container_name = container_name or unique_container_name()
     stop_container(client, container_name)
     volumes = [f"{project_path}:{CONTAINER_MODEL_DIR}", f"{project_path}/results:/results"]
+    volumes += [f"{library.resolve()}:{library_directory(library, CONTAINER_MODEL_DIR)}:ro" for library in libraries]
     if environment.libraries_path is not None:
         volumes.append(f"{environment.libraries_path.resolve()}:{CONTAINER_LIBRARIES}")
     container = client.containers.run(
@@ -549,15 +573,22 @@ def load_statements(
     model_file: str,
     environment: ModelicaEnvironment = MODELICA_ENVIRONMENT,
     model_dir: PurePath = CONTAINER_MODEL_DIR,
+    libraries: Sequence[PurePath] = (),
 ) -> str:
     """The OpenModelica statements loading the libraries and the model file ``<model_dir>/<model_file>``.
 
-    ``model`` is the Modelica text of the file: it tells whether AixLib has to be loaded too.
+    ``model`` is the Modelica text of the file: it tells whether AixLib has to be loaded too. ``libraries`` are the
+    folders, as ``omc`` sees them, of the libraries the model uses without holding them, loaded before it.
     """
+    used = "".join(
+        f"""
+    loadFile("{library.as_posix()}/package.mo");"""
+        for library in libraries
+    )
     return f"""
     getVersion();
     loadModel(Modelica, {{"{environment.modelica_version}"}});
-    loadModel(IDEAS, {{"{environment.ideas}"}});{_load_aixlib(model, environment)}
+    loadModel(IDEAS, {{"{environment.ideas}"}});{_load_aixlib(model, environment)}{used}
     loadFile("{model_dir.as_posix()}/{model_file}");"""
 
 
@@ -591,6 +622,7 @@ def create_mos_file(  # noqa: PLR0913
             environment,
             model_dir,
             report_check_errors,
+            [library_directory(library, model_dir) for library in used_libraries(network)],
         )
         Path(temp_mos_file.name).write_text(mos_file)
         yield Path(temp_mos_file.name).name
@@ -620,16 +652,17 @@ def mos_script(  # noqa: PLR0913
     environment: ModelicaEnvironment = MODELICA_ENVIRONMENT,
     model_dir: PurePath = CONTAINER_MODEL_DIR,
     report_check_errors: bool = False,
+    libraries: Sequence[PurePath] = (),
 ) -> str:
     """The OpenModelica script loading the libraries and ``model_dir/model_file``, checking the package ``name``
     and simulating its top model (unless ``check_only``). ``model`` is the text of the file: it tells whether
-    AixLib has to be loaded."""
+    AixLib has to be loaded; ``libraries`` are the folders of the libraries it uses, as ``omc`` sees them."""
     if options.check_only:
         simulation = "\n    getErrorString();" if report_check_errors else ""
     else:
         simulation = f"""
     simulate({name}.{TOP_MODEL}, {options.simulate_arguments});
     getErrorString();"""
-    return f"""{load_statements(model, model_file, environment, model_dir)}
+    return f"""{load_statements(model, model_file, environment, model_dir, libraries)}
     checkModel({name}.{TOP_MODEL});{simulation}
     """
