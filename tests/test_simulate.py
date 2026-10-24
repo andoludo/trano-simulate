@@ -32,6 +32,19 @@ DECAY = """package Decay
   end building;
 end Decay;
 """
+RATES = """within;
+package Rates
+  constant Real decay = 1 "Rate of the decay of Plant";
+end Rates;
+"""
+PLANT = """package Plant
+  model building
+    Real x(start=1, fixed=true);
+  equation
+    der(x) = -Rates.decay*x;
+  end building;
+end Plant;
+"""
 BROKEN = """package Broken
   model building
     Real x;
@@ -161,6 +174,32 @@ def test_the_script_reads_the_model_where_omc_sees_the_project(tmp_path: Path) -
     assert list(tmp_path.glob("*.mo*")) == []  # the temporary files are removed
 
 
+def rates_library(path: Path) -> Path:
+    """A Modelica library stored in its folder, which the package ``PLANT`` uses without holding it."""
+    library = path / "Rates"
+    library.mkdir()
+    (library / "package.mo").write_text(RATES)
+    return library
+
+
+def test_the_libraries_a_package_uses_are_loaded_before_it_where_omc_sees_them(tmp_path: Path) -> None:
+    library = rates_library(tmp_path)
+    package = ModelPackage(name="Plant", source=PLANT, libraries=(library,))
+    project = tmp_path / "project"
+    project.mkdir()
+
+    with create_mos_file(package, SimulationOptions(), project) as script_name:  # in the container
+        script = (project / script_name).read_text()
+        assert script.index('loadFile("/libraries/Rates/package.mo");') < script.index('loadFile("/simulation/')
+    with create_mos_file(package, SimulationOptions(), project, model_dir=project) as script_name:  # local
+        assert f'loadFile("{library.resolve().as_posix()}/package.mo");' in (project / script_name).read_text()
+
+
+def test_a_source_without_libraries_loads_none(tmp_path: Path) -> None:
+    with create_mos_file(FakeSource(), SimulationOptions(), tmp_path) as script_name:
+        assert "/libraries/" not in (tmp_path / script_name).read_text()
+
+
 def test_a_package_simulates_with_the_local_runtime(tmp_path: Path, fake_omc: FakeOmc) -> None:
     result = run_simulation(tmp_path, ModelPackage(name="Decay", source=DECAY), runtime="local")
 
@@ -204,6 +243,21 @@ def test_a_package_simulates_with_openmodelica(tmp_path: Path, runtime: str) -> 
     options = SimulationOptions(end_time=1, tolerance=1e-8, number_of_intervals=100)
 
     result = run_simulation(tmp_path, ModelPackage(name="Decay", source=DECAY), options=options, runtime=runtime)
+
+    assert result.success, result.log[-3000:]
+    assert result.result_path is not None
+    assert _final_value(result.result_path, "x") == pytest.approx(math.exp(-1), rel=1e-5)
+
+
+@pytest.mark.parametrize("runtime", RUNTIMES)
+def test_a_package_simulates_with_a_library_it_uses(tmp_path: Path, runtime: str) -> None:
+    """x' = -decay x, the rate from the library loaded beside the package."""
+    options = SimulationOptions(end_time=1, tolerance=1e-8, number_of_intervals=100)
+    package = ModelPackage(name="Plant", source=PLANT, libraries=(rates_library(tmp_path),))
+    project = tmp_path / "project"
+    project.mkdir()
+
+    result = run_simulation(project, package, options=options, runtime=runtime)
 
     assert result.success, result.log[-3000:]
     assert result.result_path is not None
